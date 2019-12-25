@@ -1,0 +1,119 @@
+
+==== Packets ====
+p1: inter-arrival time should be 632.767ms
+
+p2: inter-arrival time should be 803.251ms
+
+p3: inter-arrival time should be 308.416ms
+
+p4: inter-arrival time should be 517.719ms
+
+p5: inter-arrival time should be 381.483ms
+
+p6: inter-arrival time should be 621.831ms
+
+p7: inter-arrival time should be 472.131ms
+    time in Q1 should be 0.003ms
+    time in Q2 should be 0.027ms
+    should request 913ms of service time
+    time in S1 should be 913.680ms
+    time in system should be 913.739ms
+
+p8: inter-arrival time should be 88.643ms
+
+p9: inter-arrival time should be 285.003ms
+    time in Q1 should be 0.004ms
+    time in Q2 should be 0.026ms
+    should request 319ms of service time
+    time in S2 should be 320.325ms
+    time in system should be 320.392ms
+
+p10: inter-arrival time should be 44.240ms
+
+p11: inter-arrival time should be 450.596ms
+
+p12: inter-arrival time should be 772.369ms
+    time in Q1 should be 0.002ms
+    time in Q2 should be 0.018ms
+    should request 235ms of service time
+    time in S1 should be 235.645ms
+    time in system should be 235.681ms
+
+p13: inter-arrival time should be 641.038ms
+
+p14: inter-arrival time should be 669.503ms
+
+p15: inter-arrival time should be 935.119ms
+
+p16: inter-arrival time should be 425.164ms
+
+p17: inter-arrival time should be 249.088ms
+    time in Q1 should be 0.003ms
+    time in Q2 should be 0.017ms
+    should request 247ms of service time
+    time in S1 should be 250.963ms
+    time in system should be 251.000ms
+
+p18: inter-arrival time should be 965.360ms
+    time in Q1 should be 0.003ms
+    time in Q2 should be 0.017ms
+    should request 988ms of service time
+    time in S1 should be 988.173ms
+    time in system should be 988.208ms
+
+p19: inter-arrival time should be 173.811ms
+
+p20: inter-arrival time should be 342.326ms
+
+p21: inter-arrival time should be 680.225ms
+
+p22: inter-arrival time should be 476.353ms
+
+p23: inter-arrival time should be 254.199ms
+
+p24: inter-arrival time should be 708.404ms
+
+p25: inter-arrival time should be 708.405ms
+    time in Q1 should be 0.002ms
+    time in Q2 should be 0.018ms
+    should request 826ms of service time
+    time in S2 should be 826.457ms
+    time in system should be 826.494ms
+
+p26: inter-arrival time should be 256.925ms
+    time in Q1 should be 0.003ms
+    time in Q2 should be 0.014ms
+    should request 297ms of service time
+    time in S1 should be 297.307ms
+    time in system should be 297.339ms
+
+p27: inter-arrival time should be 789.749ms
+
+p28: inter-arrival time should be 224.275ms
+
+p29: inter-arrival time should be 6.257ms
+
+p30: inter-arrival time should be 314.654ms
+    time in Q1 should be 0.002ms
+    time in Q2 should be 0.015ms
+    should request 570ms of service time
+    time in S1 should be 570.388ms
+    time in system should be 570.423ms
+
+p31: inter-arrival time should be 84.237ms
+
+p32: inter-arrival time should be 335.251ms
+
+p33: inter-arrival time should be 596.299ms
+
+==== Statistics ====
+average packet inter-arrival time = 0.461063363636364
+average packet service time = 0.55036725
+average number of packets in Q1 = 1.44265208766184e-06
+average number of packets in Q2 = 9.96741442384541e-06
+average number of packets in S1 = 0.213522738688755
+average number of packets in S2 = 0.0752003384724098
+average time a packet spent in system = 0.5504095
+standard deviation for time spent in system = 0.297058884982002
+token drop probability = 0.986666666666667
+packet drop probability = 0.757575757575758
