@@ -56,7 +56,7 @@ typedef struct tagMy402List {
     My402ListElem *(*Find)(struct tagMy402List *, void *obj);
 } My402List;
 
-
+extern int  My402ListLength(My402List*);
 extern int  My402ListEmpty(My402List*);
 
 extern int  My402ListAppend(My402List*, void*);

@@ -1,877 +1,891 @@
-#include <stdio.h>
-#include <pthread.h>
-#include <stdlib.h>
+#include<stdio.h>
+#include<stdlib.h>
+#include<pthread.h>
+#include <unistd.h>
+#include <sys/time.h>
 #include <string.h>
+#include <math.h>
 #include <unistd.h>
 #include <signal.h>
-#include <math.h>
-#include <sys/time.h>
-
 #include "cs402.h"
 #include "my402list.h"
-#include "warmup2.h"
 
-// one thread for packet arrival
-// one thread for token arrival
-// one thread for server
-// must not use one thread for each packet.
-// In addition, use at least one mutex to protect Q1, Q2, and the token bucket.
-// Finally, Q1 and Q2 must have infinite capacity
+typedef struct tagMy402Packet {
+    int packet_number;
+    struct timeval arrival_time;
+    struct timeval enter_time_Q1;
+    struct timeval departure_time_Q1; 
+    struct timeval enter_time_Q2;
+    struct timeval departure_time_Q2;
+    struct timeval enter_time_service;
+    struct timeval departure_time_service;
+    double service_time;
+    int tokens_required;
+}Packet;
 
-/*---------------------------------Global---------------------------------*/
-
+//Mutex and CV
 pthread_mutex_t Mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t Queue_Not_Empty_Cond = PTHREAD_COND_INITIALIZER;
-long int Queue_Amount_Guard = 0;
+pthread_cond_t Q2_Not_Empty_Cond = PTHREAD_COND_INITIALIZER;
 
-pthread_t packet_id, token_id, server_id, int_id, extra_packet_id;
 
-double Lambda, R, Mu;
+//Other parameters
+My402List *Q1, *Q2;
+int TotalTokens = 0;
+int TotalPackets = 0;
+int TotalPacketsServed = 0;
+int CurrentTokens = 0;
+int TokensDropped = 0;
+int PacketsDropped = 0;
+struct timeval eval_start, last_packet_arrival_time, last_token_arrival_time;
+struct timeval exit_Q1, enter_Q2;
+int kill_packet_thread = 0, token_thread_dead = 0, server_thread_dead = 0, controlCPressed = 0;
+FILE *fp;
 
-long int Num, Left_Num = 0, B, P, Bucket = 0;
+//Simulation parameter default values
+double lambda = 1;
+double mu = 0.35;
+double r = 1.5;
+int P = 3;
+int B = 10;
+int num = 20;
+int max_num = 2147483647; 
+char *file=NULL;
 
-int Mode, Debug = 0;
+//Statistics
+double average_inter_arrival_time = 0, total_emulation_time = 0, average_service_time, average_packets_in_Q1=0,
+	average_packets_in_Q2=0, average_packets_in_S1=0, average_packets_in_S2=0, average_time_spent_in_system=0, 
+	average_sqared_time_spent_in_system=0;
 
-My402List Q1, Q2, Packet_List, Collect_List;
 
-struct timeval Start_Time;
+//Signal
+sigset_t sig;
 
-sigset_t Signal_Mask;
+//create four threds and join them 
+pthread_t packet_arrival_thread, token_adding_thread, server_thread_one, server_thread_two, signal_thread;
 
-int Server_Stop = 0, Extra_Packet_Stop = 0;
-
-char * Command_Parameter[DEFAULT_COMMAND_PARAMETER_NUMBER];
-
-long int Total_Token = 0, Discard_Token = 0;
-long int Total_Packet = 0, Discard_Packet = 0;
-
-void * prepare_extra_packet();
-
-/*---------------------------------Utility---------------------------------*/
-
-void error(char * message)
-{
-	fprintf(stderr, "Error: %s, program abort!\n", message);
-	exit(1);
+long int timeValToLongInt(struct timeval time){
+	long int converted_time = time.tv_sec * 1000000 + time.tv_usec;
+	return converted_time;
 }
 
-double time_use(struct timeval End_Time)
-{
-	// double timeu  = SEC_TO_MSEC * (End_Time.tv_sec - Start_Time.tv_sec) + End_Time.tv_usec - Start_Time.tv_usec;
-	// timeu /= SEC_TO_MISEC;
-	double timeu = SEC_TO_MISEC * (End_Time.tv_sec - Start_Time.tv_sec) + ((double)(End_Time.tv_usec - Start_Time.tv_usec)) / SEC_TO_MISEC;
-	return timeu;
+void printAll(My402List *list){
+    My402ListElem *currElem=NULL;
+
+    for (currElem=My402ListFirst(list); currElem != NULL; currElem=My402ListNext(list, currElem)){
+        printf("%d\n", (int)((Packet *)(currElem->obj))->packet_number);
+        printf("%d\n", (int)((Packet *)(currElem->obj))->tokens_required);
+
+    }
 }
 
-void debug(char * message)
+void *signalC()
 {
-	fprintf(stdout, "Debug: %s.\n", message);
-}
-
-int command_index(char * _command)
-{
-	if(!strcmp(_command, "-lambda"))
-		return LAMBDA_PARAMETER;
-	if(!strcmp(_command, "-mu"))
-		return MU_PARAMETER;
-	if(!strcmp(_command, "-r"))
-		return R_PARAMETER;
-	if(!strcmp(_command, "-B"))
-		return B_PARAMETER;
-	if(!strcmp(_command, "-P"))
-		return P_PARAMETER;
-	if(!strcmp(_command, "-n"))
-		return NUM_PARAMETER;
-	if(!strcmp(_command, "-t"))
-		return TSFILE_PARAMETER;
-	return ERROR;
-}
-
-void command_input(int argc, char * argv[])
-{
-	int i, index;
-	for(i = 0; i < DEFAULT_COMMAND_PARAMETER_NUMBER; i++)
-		Command_Parameter[i] = 0;
-	for(i = 1; i < argc; i++)
-	{
-		if((index = command_index(argv[i])) == ERROR)
-			error("undefined command");
-		if(++i >= argc)
-			error("command value missing");
-		Command_Parameter[index] = argv[i];
-	}
-}
-
-double real_parse(char * str)
-{
-	int i = 0, flag = 0;
-	while(str[i] != '\0' && str[i] != '\n')
-	{
-		if(str[i] < '0' || str[i] > '9')
-		{
-			if(str[i] == '.' && flag == 0)
-				flag++;
-			else
-				error("command value error");
-		}
-		i++;
-	}
-	return atof(str);
-}
-
-long int int_parse(char * str)
-{
-	int i = 0;
-	long long int value = 0;
-	while(str[i] != '\0' && str[i] != '\n')
-	{
-		if(str[i] >= '0' && str[i] <= '9')
-		{
-			value += (str[i++] - '0');
-			value *= 10;
-		}
-		else
-			error("command value error");
-	}
-	value /= 10;
-	if(Debug)
-		fprintf(stdout, "Debug: in int_parse value %lld\n", value);
-	if(value > MAX_B_P_NUM)
-		error("poitive integers must not large than 2147483647");
-	return value;
-}
-
-double max_limit(double interval)
-{
-	if(interval <= 0 || interval >= (10 * SEC_TO_MSEC))
-		interval = 10 * SEC_TO_MSEC;
-	return interval;
-}
-
-/*---------------------------------Initial---------------------------------*/
-
-void command_parse()
-{
-	if(Command_Parameter[TSFILE_PARAMETER] != 0)
-	{
-		// run in trace-driven mode
-		Mode = TRACE_DRIVEN;
-		if(Debug)
-			debug("run in trace-driven mode");
-	}
-	else
-	{
-		// run in deterministic mode
-		Mode = DETERMINISTIC;
-		if(Debug)
-			debug("run in deterministic mode");
-		if(Command_Parameter[LAMBDA_PARAMETER] != 0)
-			Lambda = real_parse(Command_Parameter[LAMBDA_PARAMETER]);
-		else
-			Lambda = DEFAULT_PACKET_ARRIVE_RATE;
-
-		if(Command_Parameter[MU_PARAMETER] != 0)
-			Mu = real_parse(Command_Parameter[MU_PARAMETER]);
-		else
-			Mu = DEFAULT_PACKET_SERVE_RATE;
-		if(Command_Parameter[P_PARAMETER] != 0)
-			P = int_parse(Command_Parameter[P_PARAMETER]);
-		else
-			P = DEFAULT_TOKEN_REQUIRE_AMOUNT;
-		if(Command_Parameter[NUM_PARAMETER] != 0)
-		{
-			if(Debug)
-				fprintf(stdout, "Debug: -n %s\n", Command_Parameter[NUM_PARAMETER]);
-			Num = int_parse(Command_Parameter[NUM_PARAMETER]);
-			if(Debug)
-				fprintf(stdout, "Debug: -n long int %ld\n", Num);
-		}
-		else
-			Num = DEFAULT_TOTAL_PACKET_NUMBER;
-	}
-
-	if(Command_Parameter[R_PARAMETER] != 0)
-		R = real_parse(Command_Parameter[R_PARAMETER]);
-	else
-		R = DEFAULT_TOKEN_ARRIVE_RATE;
-	if(Command_Parameter[B_PARAMETER] != 0)
-		B = int_parse(Command_Parameter[B_PARAMETER]);
-	else
-		B = DEFAULT_TOKEN_BUCKET_CAPACITY;
-}
-
-void prepare_packet()
-{
-	memset(&Q1, 0, sizeof(My402List));
-	(void)My402ListInit(&Q1);
-	memset(&Q2, 0, sizeof(My402List));
-	(void)My402ListInit(&Q2);
-	memset(&Packet_List, 0, sizeof(My402List));
-	(void)My402ListInit(&Packet_List);
-	memset(&Collect_List, 0, sizeof(My402List));
-	(void)My402ListInit(&Collect_List);
-
-	if(Mode == DETERMINISTIC)
-	{
-		int i;
-		double interval;
-		My402Packet * packet;
-		int num;
-		if(Num > MAX_PROCESS_NUM)
-		{
-			num = MAX_PROCESS_NUM;
-			Left_Num = Num - num;
-		}
-		else
-		{
-			num = Num;
-		}
-		for(i = 0; i < num; i++)
-		{
-			packet = (My402Packet *)malloc(sizeof(My402Packet));
-			interval = (1 / Lambda) * SEC_TO_MSEC;
-			interval = max_limit(interval);
-			packet -> inter_arrival_time = interval;
-			packet -> tokens_need = P;
-			interval = (1 / Mu) * SEC_TO_MSEC;
-			interval = max_limit(interval);
-			packet -> service_time = interval;
-			(void)My402ListAppend(&Packet_List, (void *)packet);
-		}
-		if(Left_Num > 0)
-		{
-			// need to create a new thread to handle large amount of packet
-			if(pthread_create(&extra_packet_id, 0, prepare_extra_packet, 0))
-				error("create extra packet prepare thread failed");
-		}
-	}
-
-	// read from file
-	if(Mode == TRACE_DRIVEN)
-	{
-		FILE * file;
-		char buffer[MAX_LINE_LENGTH + 2];
-		buffer[MAX_LINE_LENGTH] = '\0';
-		My402Packet * packet;
-		if((file = fopen(Command_Parameter[TSFILE_PARAMETER], "r")) == NULL)
-			error("cannot open file");
-		// read the number
-		if(fgets(buffer, MAX_LINE_LENGTH + 2, file))
-	   	{
-	   		if(buffer[MAX_LINE_LENGTH] != 0)
-	   			error("one line in the file is too long");
-	   		Num = int_parse(buffer);
-	   	}
-	   	int i, index = -1;
-	   	char temp_num[3][MAX_LINE_LENGTH];
-	   	// index 0:packet arrival time 1:token need 2:server time
-		while(!feof(file))
-		{
-			i = 0, index = -1;
-			// read one line
-	   		if(fgets(buffer, MAX_LINE_LENGTH + 2, file))
-	   		{
-	   			// parse the line
-	   			while(buffer[i] != '\0' && buffer[i] != '\n')
-	   			{
-	   				if(buffer[i] == ' ' || buffer[i] == '\t')
-	   				{
-	   					i++;
-	   					continue;
-	   				}
-	   				index++;
-	   				if(index >= 3)
-	   					break;
-	   				int k = 0;
-	   				while(buffer[i] != ' ' && buffer[i] != '\t' && buffer[i] != '\0')
-	   				{
-	   					temp_num[index][k++] = buffer[i];
-	   					i++;
-	   				}
-	   				temp_num[index][k] = '\0';
-	   			}
-	   			packet = (My402Packet *)malloc(sizeof(My402Packet));
-				packet -> inter_arrival_time = real_parse(temp_num[0]) * SEC_TO_MISEC;
-				packet -> tokens_need = int_parse(temp_num[1]);
-				packet -> service_time = real_parse(temp_num[2]) * SEC_TO_MISEC;
-				(void)My402ListAppend(&Packet_List, (void *)packet);
-	   		}
-	   	}
-	   	fclose(file);
-	}
-}
-
-void show_parameters()
-{
-	fprintf(stdout, "Emulation Parameters:\n");
-	fprintf(stdout, "\tlambda = %g\t\t\t(if -t is not specified)\n", Command_Parameter[LAMBDA_PARAMETER] == 0 ? DEFAULT_PACKET_ARRIVE_RATE : Lambda);
-	fprintf(stdout, "\tmu = %g\t\t\t(if -t is not specified)\n", Command_Parameter[MU_PARAMETER] == 0 ? DEFAULT_PACKET_SERVE_RATE : Mu);
-	fprintf(stdout, "\tr = %g\n", R);
-	fprintf(stdout, "\tB = %ld\n", B);
-	fprintf(stdout, "\tP = %ld\t\t\t\t(if -t is not specified)\n", P);
-	fprintf(stdout, "\tnumber to arrive = %ld\t\t(if -t is not specified)\n", Num);
-	fprintf(stdout, "\ttsfile = %s\t\t\t(if -t is specified)\n\n", Command_Parameter[TSFILE_PARAMETER] == 0 ? "NULL" : Command_Parameter[TSFILE_PARAMETER]);
-}
-
-void initial(int argc, char * argv[])
-{
-	sigemptyset(&Signal_Mask);
-	sigaddset (&Signal_Mask, SIGINT);
-	sigaddset (&Signal_Mask, SIGUSR1);
-	sigaddset (&Signal_Mask, SIGUSR2);
-	if(pthread_sigmask(SIG_BLOCK, &Signal_Mask, 0))
-		error("set main thread signal mask failed");
-	if(Debug)
-		debug("initializing...");
-	command_input(argc, argv);
-	command_parse();
-	show_parameters();
-	prepare_packet();
-	if(Debug)
-		debug("initialize finished");
-}
-
-/*---------------------------------Extra Packet Prepare Thread---------------------------------*/
-
-void * prepare_extra_packet()
-{
-	int num = 0, i;
-	double interval;
-	My402Packet * packet;
-	if(Debug)
-		debug("handle extra packet");
-	while(Left_Num > 0 && Extra_Packet_Stop == 0)
-	{
-		if(Debug)
-			fprintf(stdout, "Debug: left num = %ld\n", Left_Num);
-		if(Left_Num > MAX_PROCESS_NUM)
-		{
-			num = MAX_PROCESS_NUM;
-			Left_Num -= MAX_PROCESS_NUM;
-		}
-		else
-		{
-			num = Left_Num;
-			Left_Num = 0;
-		}
-		pthread_mutex_lock(&Mutex);
-		for(i = 0; i < num; i++)
-		{
-			packet = (My402Packet *)malloc(sizeof(My402Packet));
-			interval = (1 / Lambda) * SEC_TO_MSEC;
-			interval = max_limit(interval);
-			packet -> inter_arrival_time = interval;
-			packet -> tokens_need = P;
-			interval = (1 / Mu) * SEC_TO_MSEC;
-			interval = max_limit(interval);
-			packet -> service_time = interval;
-			(void)My402ListAppend(&Packet_List, (void *)packet);
-		}
-		pthread_mutex_unlock(&Mutex);
-		usleep(SEC_TO_MSEC);
-	}
-	if(Debug)
-		debug("handle extra packet stop");
-	return(0);
-}
-
-/*---------------------------------Token Thread---------------------------------*/
-
-void token_cleanup(int sig)
-{
-    pthread_mutex_trylock(&Mutex);
-    My402ListUnlinkAll(&Q2);
-    Queue_Amount_Guard = 0;
-    pthread_mutex_unlock(&Mutex);
-	if(Debug)
-		debug("token arrival thread stop");
-    pthread_exit(0);
-}
-
-// the token arrival thread sits in a loop
-// sleeps for an interval, trying to match a given interarrival time for tokens
-// wakes up, locks mutex, try to increment token count
-// check if it can move a packet from Q1 to Q2
-// if packet is added to Q2 and Q2 was empty before, signal or broadcast a queue-not-empty condition
-// unlocks mutex
-// goes back to sleep for the "right" amount
-void * token_arrival(void * arg)
-{
-	double interval = 1 / R * SEC_TO_MSEC;
-	interval = max_limit(interval);
-
-	struct timeval end_time;
-	double token_arrival_time, token_last_end_time, token_last_start_time = 0;
-	double sleep_time;
-
-	// unblock the SIGUSR2 signal
-	sigset_t signal_mask;
-	sigemptyset(&signal_mask);
-	sigaddset (&signal_mask, SIGUSR2);
-	if(pthread_sigmask(SIG_UNBLOCK, &signal_mask, 0))
-		error("set packet arrival thread signal mask failed");
-	// bind the signal handler
-	// signal(SIGUSR2, token_cleanup);
-	struct sigaction act;
-	sigemptyset(&act.sa_mask);
-	act.sa_flags = 0;
-	act.sa_handler = token_cleanup;
-	sigaction(SIGUSR2, &act, NULL);
-
-	while(TRUE)
-	{
-		gettimeofday(&end_time, 0);
-		token_last_end_time = time_use(end_time);
-
-		sleep_time = interval - token_last_end_time + token_last_start_time;
-		if(sleep_time < 0)
-			sleep_time = 1;
-
-		usleep(sleep_time);
-
-		Total_Token++;
-		pthread_mutex_lock(&Mutex);
-
-		if(My402ListEmpty(&Packet_List) && My402ListEmpty(&Q1))
-		{
-			if(My402ListEmpty(&Q2))
-				pthread_cond_broadcast(&Queue_Not_Empty_Cond);
-
-			pthread_mutex_unlock(&Mutex);
-			break;
-		}
-
-		gettimeofday(&end_time, 0);
-		token_arrival_time = time_use(end_time);
-
-		if(Bucket < B)
-		{
-			if(Debug)
-				debug("Bucket++");
-
-			Bucket++;
-			fprintf(stdout, "%012.3fms: token t%ld arrives, token bucket now has %ld token\n", token_arrival_time, Total_Token, Bucket);
-		}
-		else
-		{
-			if(Debug)
-				debug("Token discard");
-
-			Discard_Token++;
-			fprintf(stdout, "%012.3fms: token t%ld arrives, dropped\n", token_arrival_time, Total_Token);
-		}
-
-		token_last_start_time = token_arrival_time;
-
-		if(!My402ListEmpty(&Q1))
-		{
-			// see if there is enough tokens to make the packet at the head of Q1 be eligiable for transmissions
-			My402ListElem * elem = My402ListFirst(&Q1);
-			My402Packet * packet = (My402Packet *)(elem -> obj);
-			if(Bucket >= packet -> tokens_need)
-			{
-				// If it does, it will remove the corresponding number of tokens from the token bucket
-				Bucket -= packet -> tokens_need;
-				// remove that packet from Q1 and move it into Q2
-				(void)My402ListUnlink(&Q1, elem);
-				gettimeofday(&end_time, 0);
-				packet -> time_end_from_Q1 = time_use(end_time);
-
-				fprintf(stdout, "%012.3fms: p%ld leaves Q1, time in Q1 = %gms, token bucket now has %ld token\n",
-					packet -> time_end_from_Q1, packet -> packet_num, packet -> time_end_from_Q1 - packet -> time_start_in_Q1, Bucket);
-
-
-				int empty_before = My402ListEmpty(&Q2);
-				(void)My402ListAppend(&Q2, (void *)packet);
-				gettimeofday(&end_time, 0);
-
-				packet -> time_start_in_Q2 = time_use(end_time);
-
-				fprintf(stdout, "%012.3fms: p%ld enters Q2\n", packet -> time_start_in_Q2, packet -> packet_num);
-
-
-				if(Debug)
-					debug("move packet from Q1 to Q2, Queue_Amount_Guard++");
-				Queue_Amount_Guard++;
-				// wake up the server (by broadcasting the corresponding condition)
-				if(empty_before)
-					pthread_cond_broadcast(&Queue_Not_Empty_Cond);
-				if(Debug)
-					debug("wake up the server");
-			}
-		}
-		pthread_mutex_unlock(&Mutex);
-	}
-	if(Debug)
-		debug("token arrival thread stop");
-	return(0);
-}
-
-/*---------------------------------Packet Thread---------------------------------*/
-
-void packet_cleanup(int sig)
-{
-    pthread_mutex_trylock(&Mutex);
-    My402ListUnlinkAll(&Packet_List);
-    My402ListUnlinkAll(&Q1);
-    pthread_mutex_unlock(&Mutex);
-	if(Debug)
-		debug("packet arrival thread stop");
-    pthread_exit(0);
-}
-
-// the arrival thread sits in a loop
-// sleeps for an interval, trying to match a given interarrival time (from trace or deterministic)
-// wakes up, creates a packet object, locks mutex enqueues the packet to Q1 or Q2
-// if Q2 was empty before, need to signal or broadcast a queue-not-empty condition
-// unlocks mutex
-// goes back to sleep for the "right" amount
-void * packet_arrival(void * arg)
-{
-	My402ListElem * elem;
-	My402Packet * packet;
-	struct timeval end_time;
-	double packet_last_end_time, packet_last_start_time = 0;
-	double sleep_time;
-
-	// unblock the SIGUSR1 signal
-	sigset_t signal_mask;
-	sigemptyset(&signal_mask);
-	sigaddset (&signal_mask, SIGUSR1);
-	if(pthread_sigmask(SIG_UNBLOCK, &signal_mask, 0))
-		error("set packet arrival thread signal mask failed");
-	// bind the signal handler
-	// signal(SIGUSR1, packet_cleanup);
-	struct sigaction act;
-	sigemptyset(&act.sa_mask);
-	act.sa_flags = 0;
-	act.sa_handler = packet_cleanup;
-	sigaction(SIGUSR1, &act, NULL);
-
-	while(TRUE)
-	{
-		pthread_mutex_lock(&Mutex);
-
-		// if no more packet will arrive, exit the thread
-		if(My402ListEmpty(&Packet_List))
-		{
-			pthread_mutex_unlock(&Mutex);
-				break;
-		}
-
-		elem = My402ListFirst(&Packet_List);
-
-		packet = (My402Packet *)(elem -> obj);
-
-		Total_Packet++;
-		pthread_mutex_unlock(&Mutex);
-
-		gettimeofday(&end_time, 0);
-		packet_last_end_time = time_use(end_time);
-
-		// sleep
-		sleep_time = packet -> inter_arrival_time - packet_last_end_time + packet_last_start_time;
-		if(sleep_time < 0)
-			sleep_time = 1;
-		usleep(sleep_time);
-
-		pthread_mutex_lock(&Mutex);
-
-		gettimeofday(&end_time, 0);
-		packet -> time_packet_arrival = time_use(end_time);
-
-		if(packet -> tokens_need > B)
-		{
-			(void)My402ListUnlink(&Packet_List, elem);
-			fprintf(stdout, "%012.3fms: packet p%ld arrives, needs %ld tokens, dropped\n", packet -> time_packet_arrival, Total_Packet, packet -> tokens_need);
-			Discard_Packet++;
-			pthread_mutex_unlock(&Mutex);
-			free(packet);
-			continue;
-		}
-
-		packet -> packet_num = Total_Packet;
-		if(Debug)
-			debug("packet arrival");
-		
-		// gettimeofday(&end_time, 0);
-		// packet -> time_packet_arrival = time_use(end_time);
-
-		fprintf(stdout, "%012.3fms: p%ld arrives, needs %ld tokens, inter-arrival time = %.3fms\n",
-			packet -> time_packet_arrival, Total_Packet, packet -> tokens_need, packet -> time_packet_arrival - packet_last_start_time);
-
-		packet_last_start_time = packet -> time_packet_arrival;
-
-		if(Debug)
-			debug("enqueues the packet to Q1");
-		// enqueues the packet to Q1
-		(void)My402ListAppend(&Q1, (void *)packet);
-		gettimeofday(&end_time, 0);
-		packet -> time_start_in_Q1 = time_use(end_time);
-
-		fprintf(stdout, "%012.3fms: p%ld enters Q1\n", packet -> time_start_in_Q1, packet -> packet_num);
-
-
-		// if token's number is enough, and no packet waiting in the Q1
-		if(Bucket >= packet -> tokens_need && (My402ListLength(&Q1) == 1))
-		{
-			// remove that packet from Q1 and move it into Q2
-			My402ListElem * elem_temp = My402ListFirst(&Q1);
-			(void)My402ListUnlink(&Q1, elem_temp);
-			gettimeofday(&end_time, 0);
-			packet -> time_end_from_Q1 = time_use(end_time);
-
-			fprintf(stdout, "%012.3fms: p%ld leaves Q1, time in Q1 = %gms, token bucket now has %ld token\n",
-				packet -> time_end_from_Q1, packet -> packet_num, packet -> time_end_from_Q1 - packet -> time_start_in_Q1, Bucket);
-
-			if(Debug)
-				debug("enqueues the packet to Q2, Queue_Amount_Guard++");
-			int empty_before = My402ListEmpty(&Q2);
-			// enqueues the packet to Q2
-			Bucket -= packet -> tokens_need;
-			(void)My402ListAppend(&Q2, (void *)packet);
-			Queue_Amount_Guard++;
-			gettimeofday(&end_time, 0);
-			packet -> time_start_in_Q2 = time_use(end_time);
-
-			fprintf(stdout, "%012.3fms: p%ld enters Q2\n", packet -> time_start_in_Q2, packet -> packet_num);
-
-			if(empty_before)
-			{
-				pthread_cond_broadcast(&Queue_Not_Empty_Cond);
-				if(Debug)
-					debug("wake up the server");
-			}
-		}
-		(void)My402ListUnlink(&Packet_List, elem);
-
-		pthread_mutex_unlock(&Mutex);
-	}
-	if(Debug)
-		debug("packet arrival thread stop");
-	return(0);
-}
-
-/*---------------------------------Statistics---------------------------------*/
-
-void packet_statistics()
-{
-	if(My402ListEmpty(&Q2))
-	{
-		My402ListUnlinkAll(&Q2);
- 		Queue_Amount_Guard = 0;
-	}
-
-	pthread_mutex_unlock(&Mutex);
-
-	My402ListElem * elem;
-	My402Packet * packet;
-	struct timeval end_time;
-	double total_emulation_time = 0, all_time_spent_in_Q1 = 0, all_time_spent_in_Q2 = 0, all_time_spent_in_S = 0, 
-	all_arrival_time = 0, packet_last_arrival_time = 0, all_server_time = 0, all_system_time = 0, deviation = 0;
-	long int served_packet_num = 0;
-
-	gettimeofday(&end_time, 0);
-	total_emulation_time = time_use(end_time);
-	elem = My402ListFirst(&Collect_List);
-	while(elem)
-	{
-		packet = (My402Packet *)(elem -> obj);
-
-		all_arrival_time += (packet -> time_packet_arrival - packet_last_arrival_time);
-		packet_last_arrival_time = packet -> time_packet_arrival;
-		all_server_time += (packet -> time_end_from_S - packet -> time_start_in_S);
-
-		all_time_spent_in_Q1 += (packet -> time_end_from_Q1 - packet -> time_start_in_Q1);
-		all_time_spent_in_Q2 += (packet -> time_end_from_Q2 - packet -> time_start_in_Q2);
-		all_time_spent_in_S += (packet -> time_end_from_S - packet -> time_start_in_S);
-
-		all_system_time += (packet -> time_end_from_S - packet -> time_packet_arrival);
-
-		served_packet_num++;
-		
-		elem = My402ListNext(&Collect_List, elem);
-	}
-	// if no packet, avoid error
-	if(served_packet_num == 0)
-		served_packet_num++;
-
-	double average_time_in_system = all_system_time / served_packet_num / SEC_TO_MISEC;
-
-	while(!My402ListEmpty(&Collect_List))
-	{
-		elem = My402ListFirst(&Collect_List);
-		packet = (My402Packet *)(elem -> obj);
-		(void)My402ListUnlink(&Collect_List, elem);
-
-		double system_time = (packet -> time_end_from_S - packet -> time_packet_arrival) / SEC_TO_MISEC;
-		double difference = system_time - average_time_in_system;
-		deviation = deviation + difference * difference;
-
-		free(packet);
-	}
-
-	deviation /= served_packet_num;
-
-	fprintf(stdout, "\nStatistics:\n");
-
-	fprintf(stdout, "\n\taverage packet inter-arrival time = %.6gs\n", all_arrival_time / served_packet_num / SEC_TO_MISEC);
-	fprintf(stdout, "\n\taverage packet service time = %.6gs\n", all_server_time / served_packet_num / SEC_TO_MISEC);
-
-	fprintf(stdout, "\n\taverage number of packets in Q1 = %.6g\n", all_time_spent_in_Q1 / total_emulation_time);
-	fprintf(stdout, "\taverage number of packets in Q2 = %.6g\n", all_time_spent_in_Q2 / total_emulation_time);
-	fprintf(stdout, "\taverage number of packets in S = %.6g\n", all_time_spent_in_S / total_emulation_time);
-
-	fprintf(stdout, "\n\taverage time a packet spent in system = %.6gs\n", average_time_in_system);
-	fprintf(stdout, "\tstandard deviation for time spent in system = %.6g\n", sqrt(deviation));
-
-	fprintf(stdout, "\n\ttoken drop probability = %.6g\n", (double)Discard_Token / Total_Token);
-	fprintf(stdout, "\tpacket drop probability = %.6g\n", (double)Discard_Packet / Total_Packet);
-
-	pthread_exit(0);
-}
-
-/*---------------------------------Server Thread---------------------------------*/
-
-// the server thread
-// initially blocked, waiting for the queue-not-empty condition to be signaled
-// when unblocked, mutex is locked
-// if Q2 is not empty, dequeues a packet and unlock mutex
-// 		sleeps for an interval matching the service time of the packet, eject the packet from the system
-// 		lock mutex, check if Q2 is empty, etc.
-// if Q2 is empty, go wait for the queue-not-empty condition to be signaled
-void * server(void * arg)
-{
-	struct timeval end_time;
-
-	while(TRUE)
-	{
-		pthread_mutex_lock(&Mutex);
-		while(!(Queue_Amount_Guard > 0))
-		{
-			if(Debug)
-				debug("server blocked");
-			// handle the stop singal when Q2 has no packet
-			if((Server_Stop) || (My402ListEmpty(&Packet_List) && My402ListEmpty(&Q1) && My402ListEmpty(&Q2)))
-			{
-				if(Debug)
-					debug("server thread stop");
-				packet_statistics();
-			}
-			pthread_cond_wait(&Queue_Not_Empty_Cond, &Mutex);
-		}
-		// handle the stop singal when Q2 has packet
-		if(Server_Stop)
-		{
-			if(Debug)
-					debug("server thread stop");
-			packet_statistics();
-		}
-		My402ListElem * elem = My402ListFirst(&Q2);
-		My402Packet * packet = (My402Packet *)(elem -> obj);
-		(void)My402ListUnlink(&Q2, elem);
-
-		if(Debug)
-			debug("start service, Queue_Amount_Guard--");
-		Queue_Amount_Guard--;
-
-		pthread_mutex_unlock(&Mutex);
-
-		gettimeofday(&end_time, 0);
-		packet -> time_start_in_S = time_use(end_time);
-		packet -> time_end_from_Q2 = packet -> time_start_in_S;
-
-		fprintf(stdout, "%012.3fms: p%ld begin service as S, time in Q2 = %.3fms\n",
-		packet -> time_start_in_S, packet -> packet_num, packet -> time_end_from_Q2 - packet -> time_start_in_Q2);
-
-		usleep(packet -> service_time);
-		if(Debug)
-			debug("end service, eject the packet");
-
-		gettimeofday(&end_time, 0);
-		packet -> time_end_from_S = time_use(end_time);
-
-		fprintf(stdout, "%012.3fms: p%ld departs from S, service time = %.3fms, time in system = %.3fms\n",
-			packet -> time_end_from_S, packet -> packet_num, packet -> time_end_from_S - packet -> time_start_in_S,
-			packet -> time_end_from_S - packet -> time_packet_arrival);
-		(void)My402ListAppend(&Collect_List, (void *)packet);
-	}
-	if(Debug)
-		debug("server thread stop");
-	return(0);
-}
-
-/*---------------------------------<Cntrl+C>---------------------------------*/
-
-// <Cntrl+C>
-// arrival thread will stop generating packets and terminate
-// 	the arrival thread needs to stop the token thread
-// 	the arrival thread needs to clear out Q1 and Q2
-// server threads must finish serving its current packet must print statistics for all packet seen
-// 	need to make sure that packets deleted this way do not participate in certain statistics calculation
-// ￼	you need to decide which ones and justify them
-void * sigint_handler(void * arg)
-{
-	int sig;
-	if(sigwait(&Signal_Mask, &sig))
-		error("handler error");
-
-	if(Debug)
-		debug("catch <Ctrl+C> in interrupt");
+	My402ListElem  *elem = NULL;
+	My402ListElem  *elem1 = NULL;
+	int set;
+	struct timeval caught, packet_removed;
+	sigwait(&sig,&set);
 
 	pthread_mutex_lock(&Mutex);
-	fprintf(stdout, "\n");
-	Extra_Packet_Stop = 1;
-	pthread_kill(packet_id, SIGUSR1);
-		if(Debug)
-		debug("send SIGUSR1");
-	pthread_kill(token_id, SIGUSR2);
-	if(Debug)
-		debug("send SIGUSR2");
-	Server_Stop = 1;
-	if(My402ListEmpty(&Q2))
-		pthread_cond_broadcast(&Queue_Not_Empty_Cond);
+	gettimeofday(&caught, NULL);
+	fprintf(stdout,"\n%012.3f: ",(double)(timeValToLongInt(caught)-timeValToLongInt(eval_start))/1000);
+	printf("SIGINT caught, no new packets or tokens will be allowed\n");
+
+	controlCPressed = 1;
+	kill_packet_thread = 1;
+	token_thread_dead = 1;
+	pthread_cond_broadcast(&Q2_Not_Empty_Cond);
+	pthread_cancel(packet_arrival_thread);
+	pthread_cancel(token_adding_thread);
+	//pthread_cond_broadcast(&cv);
+
+	for(elem = My402ListFirst(Q1); elem != NULL ; elem= My402ListNext(Q1,elem))
+	{
+		gettimeofday(&packet_removed, NULL);
+		if(My402ListEmpty(Q1) == 1)
+			break;
+		fprintf(stdout,"%012.3f: ",(double)(timeValToLongInt(packet_removed)-timeValToLongInt(eval_start))/1000);
+		fprintf(stdout, "p%d removed from Q1\n",((Packet*)(elem->obj))->packet_number);
+		My402ListUnlink(Q1, elem);
+	}
+	for(elem1 = My402ListFirst(Q2); elem1 != NULL ; elem1= My402ListNext(Q2,elem1))
+	{
+		if(My402ListEmpty(Q2) == 1)
+			break;
+		fprintf(stdout,"%012.3f: ",(double)(timeValToLongInt(caught)-timeValToLongInt(eval_start))/1000);
+		fprintf(stdout, "p%d removed from Q2\n",((Packet*)(elem1->obj))->packet_number);
+		My402ListUnlink(Q2, elem1);
+		
+	}
+	pthread_mutex_unlock(&Mutex);
+	pthread_exit(NULL);
+}
+
+void *server(void *serverNumber){
+	while(TRUE){
+		struct timeval exit_Q2, enter_service, exit_service;
+		Packet *p = NULL;
+		pthread_mutex_lock(&Mutex);
+		//Wait till a packet enters Q2
+		while(My402ListEmpty(Q2)){
+			if(kill_packet_thread == 1 && token_thread_dead == 1 && My402ListEmpty(Q2) && My402ListEmpty(Q1)){
+				server_thread_dead = 1;
+				pthread_mutex_unlock(&Mutex);
+				//printf("Exiting Server%d\n", (int)serverNumber);
+				pthread_exit(NULL);
+			}
+			pthread_cond_wait(&Q2_Not_Empty_Cond, &Mutex);
+		}
+		//printf("Out of the condition\n");
+		if(!My402ListEmpty(Q2)){
+			My402ListElem *currElem=NULL;
+			currElem=My402ListFirst(Q2);
+			p = (Packet *)(currElem->obj);
+
+			//Remove element from Q2
+			My402ListUnlink(Q2, currElem);
+			gettimeofday(&exit_Q2, 0);
+			p->departure_time_Q2 = exit_Q2;
+			fprintf(stdout,"%012.3f: ",(double)(timeValToLongInt(exit_Q2)-timeValToLongInt(eval_start))/1000);
+			printf("p%d leaves Q2, time in Q2 = %5.3fms\n", p->packet_number, (double)(timeValToLongInt(p->departure_time_Q2)-timeValToLongInt(p->enter_time_Q2))/1000);
+
+			//Enter service
+			gettimeofday(&enter_service, 0);
+			p->enter_time_service = enter_service;
+			fprintf(stdout,"%012.3f: ",(double)(timeValToLongInt(enter_service)-timeValToLongInt(eval_start))/1000);
+			printf("p%d begins service at S%d, requesting %8.3fms of service\n", p->packet_number, (int)serverNumber, p->service_time/1000);
+
+		}
+		pthread_mutex_unlock(&Mutex);
+
+		usleep(p->service_time);
+
+		pthread_mutex_lock(&Mutex);
+		gettimeofday(&exit_service, 0);
+		p->departure_time_service = exit_service;
+		fprintf(stdout,"%012.3f: ",(double)(timeValToLongInt(exit_service)-timeValToLongInt(eval_start))/1000);
+		printf("p%d departs from S%d, service time = %8.3fms, time in system = %8.3fms\n", p->packet_number, (int)serverNumber, (double)(timeValToLongInt(p->departure_time_service)-timeValToLongInt(p->enter_time_service))/1000, (double)(timeValToLongInt(p->departure_time_service)-timeValToLongInt(p->arrival_time))/1000);
+		
+		//For Stats:
+		average_service_time = (average_service_time * TotalPacketsServed + (double)(timeValToLongInt(p->departure_time_service)-timeValToLongInt(p->enter_time_service)))/(TotalPacketsServed + 1);
+		
+		average_packets_in_Q1 +=  (double)(timeValToLongInt(p->departure_time_Q1)-timeValToLongInt(p->enter_time_Q1));
+		average_packets_in_Q2 +=  (double)(timeValToLongInt(p->departure_time_Q2)-timeValToLongInt(p->enter_time_Q2));
+		if((int)serverNumber == 1){
+			average_packets_in_S1 +=  (double)(timeValToLongInt(p->departure_time_service)-timeValToLongInt(p->enter_time_service));
+		}
+		else{
+			average_packets_in_S2 +=  (double)(timeValToLongInt(p->departure_time_service)-timeValToLongInt(p->enter_time_service));
+		}
+		average_time_spent_in_system = (average_time_spent_in_system * TotalPacketsServed + (double)(timeValToLongInt(p->departure_time_service)-timeValToLongInt(p->arrival_time)))/(TotalPacketsServed + 1); 
+		average_sqared_time_spent_in_system = (average_sqared_time_spent_in_system * TotalPacketsServed + (double)(timeValToLongInt(p->departure_time_service)-timeValToLongInt(p->arrival_time)) * (timeValToLongInt(p->departure_time_service)-timeValToLongInt(p->arrival_time)))/(TotalPacketsServed + 1);
+		TotalPacketsServed++;
+		pthread_mutex_unlock(&Mutex);
+	}
+	return(0);
+}
+
+void *token_adder(){
+	long int time_to_sleep = 0;
+	long int time_between_tokens;
+	if ((1.0/r) > 10){
+		//Inter arrival greater than 10 seconds
+		time_between_tokens = 10 * 1000000;
+	}
+	else{
+		//Rounding inter-arrival to nearest millisecond
+		time_between_tokens = (1.0/r) * 1000;
+		time_between_tokens = time_between_tokens * 1000;
+	}
+	//gettimeofday(&start, 0);
+	
+	//int tokens_required = 0;
+	struct timeval token_arrival_time;
+	token_arrival_time = eval_start;
+	last_token_arrival_time = token_arrival_time;
+	//My402ListElem *elem = NULL;
+
+	while(TRUE){
+
+		time_to_sleep = time_between_tokens - (timeValToLongInt(token_arrival_time) - timeValToLongInt(last_token_arrival_time));
+		
+		if(time_to_sleep < 0){
+			time_to_sleep = 0;
+		}
+		usleep(time_to_sleep);
+
+		pthread_mutex_lock(&Mutex);
+		if(kill_packet_thread == 1 && My402ListEmpty(Q1)){
+			token_thread_dead = 1;
+			//printf("Exiting token\n");
+			pthread_cond_broadcast(&Q2_Not_Empty_Cond);
+			pthread_mutex_unlock(&Mutex);
+			//pthread_exit(NULL);
+			return(0);
+		}
+		if(controlCPressed == 1){
+			token_thread_dead = 1;
+			pthread_mutex_unlock(&Mutex);
+			pthread_exit(NULL);
+		}
+		//Token arrival
+		gettimeofday(&token_arrival_time, 0);
+		fprintf(stdout,"%012.3f: ",(double)(timeValToLongInt(token_arrival_time)-timeValToLongInt(eval_start))/1000);
+		last_token_arrival_time = token_arrival_time;
+		//printf("Token received");
+		TotalTokens++;
+		CurrentTokens++;
+		if(CurrentTokens > B){
+			printf("token t%d arrives, dropped\n", TotalTokens);
+			CurrentTokens--;
+			TokensDropped++;
+			//TotalTokens--;
+		}
+
+		else{
+			if(CurrentTokens == 1 || CurrentTokens == 0){
+				printf("token t%d arrives, token bucket now has %d token\n", TotalTokens, CurrentTokens);
+			}
+			else{
+				printf("token t%d arrives, token bucket now has %d tokens\n", TotalTokens, CurrentTokens);
+			}
+		}
+
+		if(!My402ListEmpty(Q1)){
+			//If Q1 is not empty then check if the first element can be moved to Q2
+			My402ListElem *currElem=NULL;
+			currElem=My402ListFirst(Q1);
+			Packet *p = (Packet *)(currElem->obj);
+
+			int to = (int)(p->tokens_required);
+			//tokens_required = elem->tokens_required;
+			if(to <= CurrentTokens){
+				//Move the tip element from Q1 to Q2
+				CurrentTokens = CurrentTokens - to;
+
+				gettimeofday(&exit_Q1, 0);
+				p->departure_time_Q1 = exit_Q1;
+				fprintf(stdout,"%012.3f: ",(double)(timeValToLongInt(exit_Q1)-timeValToLongInt(eval_start))/1000);
+				if(CurrentTokens == 0 || CurrentTokens == 1){
+					printf("p%d leaves Q1, time in Q1 = %7.3fms, token bucket now has %d token\n", p->packet_number, (double)(timeValToLongInt(p->departure_time_Q1)-timeValToLongInt(p->enter_time_Q1))/1000, CurrentTokens);
+				}
+				else{
+					printf("p%d leaves Q1, time in Q1 = %7.3fms, token bucket now has %d tokens\n", p->packet_number, (double)(timeValToLongInt(p->departure_time_Q1)-timeValToLongInt(p->enter_time_Q1))/1000, CurrentTokens);
+				}
+
+				My402ListAppend(Q2, (void *)p);
+				gettimeofday(&enter_Q2, 0);
+				p->enter_time_Q2 = enter_Q2;
+				fprintf(stdout,"%012.3f: ",(double)(timeValToLongInt(enter_Q2)-timeValToLongInt(eval_start))/1000);
+				printf("p%d enters Q2\n", p->packet_number);
+				
+				My402ListUnlink(Q1, currElem);
+				//printf("Tokens moved from Q1 to Q2\n");
+				//signal server threads
+				//Broadcast the condition for server threads
+				pthread_cond_broadcast(&Q2_Not_Empty_Cond);
+			}
+			
+			//printf("in loop");
+		}
+		pthread_mutex_unlock(&Mutex);
+	}
+	return(0);
+}
+
+void *packet_arrival(){
+
+	long int time_between_packets = 0;
+	if ((1.0/lambda) > 10){
+		//Inter arrival greater than 10 seconds
+		time_between_packets = 10 * 1000000;
+	}
+	else{
+		//Rounding inter-arrival to nearest millisecond
+		time_between_packets = (1.0/lambda) * 1000;
+		time_between_packets = time_between_packets * 1000;
+	}
+
+	long int time_to_sleep = 0;
+	long int packet_service_time = 0;
+	struct timeval packet_arrival_time;
+	struct timeval exit_Q1;
+	struct timeval enter_Q1;
+	packet_arrival_time = last_packet_arrival_time;
+
+	for(int i = 1; i<= num; i++){
+		if(controlCPressed == 1){
+			kill_packet_thread = 1;
+			pthread_mutex_unlock(&Mutex);
+			pthread_exit(NULL);
+		}
+		//time_between_packets = ((1.0/lambda) * 1000000) - 600;
+		time_to_sleep = time_between_packets - (timeValToLongInt(packet_arrival_time) - timeValToLongInt(last_packet_arrival_time));
+
+		if(time_to_sleep < 0){
+			time_to_sleep = 0;
+		}
+		//printf("%ld", time_to_sleep);
+		usleep(time_to_sleep);
+
+		if ((1.0/mu) > 10){
+			//Inter arrival greater than 10 seconds
+			packet_service_time = 10 * 1000000;
+		}
+		else{
+			//Rounding inter-arrival to nearest millisecond
+			packet_service_time = (1.0/mu) * 1000;
+			packet_service_time = packet_service_time * 1000;
+		}
+
+		Packet *p = (Packet *)malloc(sizeof(Packet));
+		p->packet_number = i;
+		p->arrival_time = packet_arrival_time;
+		p->service_time = packet_service_time;
+		p->tokens_required = P;
+
+		//printf("%d", time_to_sleep);
+		pthread_mutex_lock(&Mutex);
+		//Packet arrives
+		gettimeofday(&packet_arrival_time, 0);
+		
+		//For stats
+		
+		average_inter_arrival_time = (average_inter_arrival_time * TotalPackets + (timeValToLongInt(packet_arrival_time)-timeValToLongInt(last_packet_arrival_time)))/(TotalPackets+1);
+		TotalPackets++;
+		fprintf(stdout,"%012.3f: ",(double)(timeValToLongInt(packet_arrival_time)-timeValToLongInt(eval_start))/1000);
+
+		if(p->tokens_required > B){
+			printf("p%d arrives, needs %d tokens, inter-arrival time = %4.3fms, dropped\n", p->packet_number, p->tokens_required, (double)(timeValToLongInt(packet_arrival_time)-timeValToLongInt(last_packet_arrival_time))/1000);
+			PacketsDropped++;
+			last_packet_arrival_time = packet_arrival_time;
+		}
+		else{
+			printf("p%d arrives, needs %d tokens, inter-arrival time = %4.3fms\n", p->packet_number, p->tokens_required, (double)(timeValToLongInt(packet_arrival_time)-timeValToLongInt(last_packet_arrival_time))/1000);
+			last_packet_arrival_time = packet_arrival_time;
+			gettimeofday(&enter_Q1, 0);
+			p->enter_time_Q1 = enter_Q1;
+			fprintf(stdout,"%012.3f: ",(double)(timeValToLongInt(enter_Q1)-timeValToLongInt(eval_start))/1000);
+			if(My402ListEmpty(Q1)){
+				if(p->tokens_required <= CurrentTokens){
+					//Leave Q1 and go to Q2
+					gettimeofday(&exit_Q1, 0);
+					p->departure_time_Q1 = exit_Q1;
+					if(CurrentTokens == 0 || CurrentTokens == 1){
+						printf("p%d leaves Q1, time in Q1 = %012.3fms, token bucket now has %d token\n", p->packet_number, (double)(timeValToLongInt(p->departure_time_Q1)-timeValToLongInt(p->enter_time_Q1))/1000, CurrentTokens);
+					}
+					else{
+						printf("p%d leaves Q1, time in Q1 = %012.3fms, token bucket now has %d tokens\n", p->packet_number, (double)(timeValToLongInt(p->departure_time_Q1)-timeValToLongInt(p->enter_time_Q1))/1000, CurrentTokens);
+					}
+
+					//Enter Q2
+					My402ListAppend(Q2, (void *)p);
+					gettimeofday(&enter_Q2, 0);
+					p->enter_time_Q2 = enter_Q2;
+					fprintf(stdout,"%012.3f: ",(double)(timeValToLongInt(enter_Q2)-timeValToLongInt(eval_start))/1000);
+					printf("p%d enters Q2\n", p->packet_number);
+					
+					//Broadcast the condition for server threads
+					pthread_cond_broadcast(&Q2_Not_Empty_Cond);
+
+				}
+				else{
+					//Enter Q1 as not enough tokens
+					My402ListAppend(Q1, (void *)p);
+					printf("p%d enter Q1\n", p->packet_number);
+				}
+
+			}
+			else if(!My402ListEmpty(Q1)){
+				My402ListAppend(Q1, (void *)p);
+				printf("p%d enter Q1\n", p->packet_number);
+			}
+		}
+		
+		
+		//printf("Packet %d arrived", p->packet_number);
+		//printf("Packet added to Q1: %ld\n", timeValToLongInt(enter_Q1));
+		pthread_mutex_unlock(&Mutex);
+		
+		//printf("%d", time_between_packets);
+	}
+	//All packets entered Q1, kill packet thread
+	pthread_mutex_lock(&Mutex);
+	kill_packet_thread = 1;
 	pthread_mutex_unlock(&Mutex);
 
+	//printAll(Q1);
+	//printf("Printing Q2\n");
+	//printAll(Q2);
+	//printf("Exiting packet\n");
+	pthread_exit(NULL);
 	return(0);
 }
 
-/*---------------------------------Process---------------------------------*/
+void *packet_arrival_file(){
 
-void process()
-{
-	gettimeofday(&Start_Time, 0);
+	char temp_num[3][1024];
+	char line[1024];
+	long int time_between_packets = 0;
+	long int time_to_sleep = 0;
+	long int packet_service_time = 0;
+	struct timeval packet_arrival_time;
+	struct timeval exit_Q1;
+	struct timeval enter_Q1;
+	packet_arrival_time = last_packet_arrival_time;
 
-	fprintf(stdout, "%012.3fms: emulation begins\n", time_use(Start_Time));
 
-	// create the packet arrival thread
-	if(pthread_create(&packet_id, 0, packet_arrival, 0))
-		error("create packet arrival thread failed");
-	// create the token depositing thread
-	if(pthread_create(&token_id, 0, token_arrival, 0))
-		error("create token depositing thread failed");
-	// create the server thread
-	if(pthread_create(&server_id, 0, server, 0))
-		error("create server thread failed");
-	// create the interrupt handler
-	if(pthread_create(&int_id, 0, sigint_handler, 0))
-		error("create interrupt SIGINT thread failed");
-	// waiting for the child thread
-	pthread_join(packet_id, 0);
-	pthread_join(token_id, 0);
-	pthread_join(server_id, 0);
-}
+	for(int i = 1; i<= num; i++){
+		if(controlCPressed == 1){
+			kill_packet_thread = 1;
+			pthread_mutex_unlock(&Mutex);
+			pthread_exit(NULL);
+		}
 
-/*---------------------------------Main---------------------------------*/
+		if(fgets(line, 1024, fp)!=NULL) {
+			//printf("%s\n", line);
+			int i = 0, index = -1;
+			while(index != 3){
+				while(line[i] == ' ' || line[i] == '\t'){
+					i++;
+					continue;
+				}
 
-int main(int argc, char * argv[])
-{
-	// initial the arguments and packets
-	initial(argc, argv);
-	// create the child threads
-	process();
+				index++;
+				if(index > 3){
+					printf("Invalid input. Exiting");
+					exit(-1);
+				}
+
+				int k = 0;
+				while(line[i] != ' ' && line[i] != '\t' && line[i] != '\0'){
+					temp_num[index][k++] = line[i];
+					i++;
+				}
+				temp_num[index][k] = '\0';
+			}
+		}
+
+		//printf("%s\n", temp_num[0]);
+		//printf("%lf\n", (double)atoi(temp_num[0]));
+		//printf("%d\n", atoi(temp_num[1]));
+		//printf("%lf\n", (double)atoi(temp_num[2]));
+		time_between_packets = (long int) (atoi(temp_num[0])* 1000);
+		P = atoi(temp_num[1]);
+		packet_service_time = (long int) (atoi(temp_num[2]) * 1000);
+
+		/*
+		if ((1.0/lambda) > 10){
+			//Inter arrival greater than 10 seconds
+			time_between_packets = 10 * 1000000;
+		}
+		else{
+			//Rounding inter-arrival to nearest millisecond
+			time_between_packets = (1.0/lambda) * 1000;
+			time_between_packets = time_between_packets * 1000;
+		}
+		*/
+
+	
+		// Read in from the console 
+
+		//time_between_packets = ((1.0/lambda) * 1000000) - 600;
+		time_to_sleep = time_between_packets - (timeValToLongInt(packet_arrival_time) - timeValToLongInt(last_packet_arrival_time));
+		if(time_to_sleep < 0){
+			time_to_sleep = 0;
+		}
+		//printf("%ld", time_to_sleep);
+		usleep(time_to_sleep);
+		/*
+		if ((1.0/mu) > 10){
+			//Inter arrival greater than 10 seconds
+			packet_service_time = 10 * 1000000;
+		}
+		else{
+			//Rounding inter-arrival to nearest millisecond
+			packet_service_time = (1.0/mu) * 1000;
+			packet_service_time = packet_service_time * 1000;
+		}*/
+
+		Packet *p = (Packet *)malloc(sizeof(Packet));
+		p->packet_number = i;
+		p->arrival_time = packet_arrival_time;
+		p->service_time = packet_service_time;
+		p->tokens_required = P;
+
+		//printf("%d", time_to_sleep);
+		pthread_mutex_lock(&Mutex);
+		//Packet arrives
+		gettimeofday(&packet_arrival_time, 0);
+
+		//For stats
+		average_inter_arrival_time = (average_inter_arrival_time * TotalPackets + (timeValToLongInt(packet_arrival_time)-timeValToLongInt(last_packet_arrival_time)))/(TotalPackets+1);
+		TotalPackets++;
+		fprintf(stdout,"%012.3f: ",(double)(timeValToLongInt(packet_arrival_time)-timeValToLongInt(eval_start))/1000);
+
+		if(p->tokens_required > B){
+			printf("p%d arrives, needs %d tokens, inter-arrival time = %4.3fms, dropped\n", p->packet_number, p->tokens_required, (double)(timeValToLongInt(packet_arrival_time)-timeValToLongInt(last_packet_arrival_time))/1000);
+			PacketsDropped++;
+			last_packet_arrival_time = packet_arrival_time;
+		}
+		else{
+			printf("p%d arrives, needs %d tokens, inter-arrival time = %4.3fms\n", p->packet_number, p->tokens_required, (double)(timeValToLongInt(packet_arrival_time)-timeValToLongInt(last_packet_arrival_time))/1000);
+			last_packet_arrival_time = packet_arrival_time;
+			
+			//
+			
+			gettimeofday(&enter_Q1, 0);
+			p->enter_time_Q1 = enter_Q1;
+			fprintf(stdout,"%012.3f: ",(double)(timeValToLongInt(enter_Q1)-timeValToLongInt(eval_start))/1000);
+			if(My402ListEmpty(Q1)){
+				if(p->tokens_required <= CurrentTokens){
+					//Leave Q1 and go to Q2
+					printf("p%d enter Q1\n", p->packet_number);
+					gettimeofday(&exit_Q1, 0);
+					fprintf(stdout,"%012.3f: ",(double)(timeValToLongInt(exit_Q1)-timeValToLongInt(eval_start))/1000);
+					p->departure_time_Q1 = exit_Q1;
+					if(CurrentTokens == 0 || CurrentTokens == 1){
+						printf("p%d leaves Q1, time in Q1 = %012.3fms, token bucket now has %d token\n", p->packet_number, (double)(timeValToLongInt(p->departure_time_Q1)-timeValToLongInt(p->enter_time_Q1))/1000, CurrentTokens);
+					}
+					else{
+						printf("p%d leaves Q1, time in Q1 = %012.3fms, token bucket now has %d tokens\n", p->packet_number, (double)(timeValToLongInt(p->departure_time_Q1)-timeValToLongInt(p->enter_time_Q1))/1000, CurrentTokens);
+					}
+
+					//Enter Q2
+					My402ListAppend(Q2, (void *)p);
+					gettimeofday(&enter_Q2, 0);
+					p->enter_time_Q2 = enter_Q2;
+					fprintf(stdout,"%012.3f: ",(double)(timeValToLongInt(enter_Q2)-timeValToLongInt(eval_start))/1000);
+					printf("p%d enters Q2\n", p->packet_number);
+					
+					//Broadcast the condition for server threads
+					pthread_cond_broadcast(&Q2_Not_Empty_Cond);
+
+				}
+				else{
+					//Enter Q1 as not enough tokens
+					My402ListAppend(Q1, (void *)p);
+					printf("p%d enter Q1\n", p->packet_number);
+				}
+
+			}
+			else if(!My402ListEmpty(Q1)){
+				My402ListAppend(Q1, (void *)p);
+				printf("p%d enter Q1\n", p->packet_number);
+			}
+		}
+		
+		
+		//printf("Packet %d arrived", p->packet_number);
+		//printf("Packet added to Q1: %ld\n", timeValToLongInt(enter_Q1));
+		pthread_mutex_unlock(&Mutex);
+		
+		//printf("%d", time_between_packets);
+	}
+	//All packets entered Q1, kill packet thread
+	pthread_mutex_lock(&Mutex);
+	kill_packet_thread = 1;
+	pthread_mutex_unlock(&Mutex);
+
+	//printAll(Q1);
+	//printf("Printing Q2\n");
+	//printAll(Q2);
+	//printf("Exiting packet\n");
+	pthread_exit(NULL);
 
 	return(0);
 }
 
+void setSimulationParameters(int argc, char *argv[]){
+	// Check for malformed lines and include usage information
+	char *command;
+	//char *value;
+	double dval=(double)0;
+	int ival=(int)0;
+	
+	for(int i = 1; i < argc; i++){
+		command = argv[i];
+		i++;
 
+		if(strcmp(command,"-lambda") == 0){
+			if(i >= argc){
+				fprintf(stderr, "Malformed command.\nMissing value for argument: %s\nusage: ./warmup2 [-lambda lambda] [-mu mu] [-r r] [-B B] [-P P] [-n num] [-t tsfile]\n", argv[i-1]);
+				exit(0);
+			}
+			if(argv[i][0] == '-'){
+				fprintf(stderr, "Malformed command.\nMissing value for argument: %s\nusage: ./warmup2 [-lambda lambda] [-mu mu] [-r r] [-B B] [-P P] [-n num] [-t tsfile]\n", argv[i-1]);
+				exit(0);
+			}
+
+			else{
+		    if (sscanf(argv[i], "%lf", &dval) != 1) {
+			        /* cannot parse argv[i] to get a double value */
+			        printf("Cannot parse lambda");
+			    } else {
+			        //printf("%lf", dval);
+			        lambda = dval;
+			    }
+			}
+		}
+		else if(strcmp(command,"-mu") == 0){
+			if(i >= argc){
+				fprintf(stderr, "Malformed command.\nMissing value for argument: %s\nusage: ./warmup2 [-lambda lambda] [-mu mu] [-r r] [-B B] [-P P] [-n num] [-t tsfile]\n", argv[i-1]);
+				exit(0);
+			}
+			if(argv[i][0] == '-'){
+				fprintf(stderr, "Malformed command.\nMissing value for argument: %s\nusage: ./warmup2 [-lambda lambda] [-mu mu] [-r r] [-B B] [-P P] [-n num] [-t tsfile]\n", argv[i-1]);
+				exit(0);
+			}
+
+			else{
+			    if (sscanf(argv[i], "%lf", &dval) != 1) {
+			        /* cannot parse argv[i] to get a double value */
+			        printf("Cannot parse mu");
+			    } else {
+			        //printf("%lf", dval);
+			        mu = dval;
+			    }
+			}
+
+		}
+		else if(strcmp(command,"-r") == 0){
+			if(i >= argc){
+			fprintf(stderr, "Malformed command.\nMissing value for argument: %s\nusage: ./warmup2 [-lambda lambda] [-mu mu] [-r r] [-B B] [-P P] [-n num] [-t tsfile]\n", argv[i-1]);
+			exit(0);
+			}
+			if(argv[i][0] == '-'){
+				fprintf(stderr, "Malformed command.\nMissing value for argument: %s\nusage: ./warmup2 [-lambda lambda] [-mu mu] [-r r] [-B B] [-P P] [-n num] [-t tsfile]\n", argv[i-1]);
+				exit(0);
+			}
+
+			else{
+			    if (sscanf(argv[i], "%lf", &dval) != 1) {
+			        /* cannot parse argv[i] to get a double value */
+			        printf("Cannot parse r");
+			    } else {
+			        //printf("%lf", dval);
+			        r = dval;
+			    }
+			}
+
+		}
+		else if(strcmp(command,"-B") == 0){
+			if(i >= argc){
+			fprintf(stderr, "Malformed command.\nMissing value for argument: %s\nusage: ./warmup2 [-lambda lambda] [-mu mu] [-r r] [-B B] [-P P] [-n num] [-t tsfile]\n", argv[i-1]);
+			exit(0);
+			}
+			if(argv[i][0] == '-'){
+				fprintf(stderr, "Malformed command.\nMissing value for argument: %s\nusage: ./warmup2 [-lambda lambda] [-mu mu] [-r r] [-B B] [-P P] [-n num] [-t tsfile]\n", argv[i-1]);
+				exit(0);
+			}
+
+			else{
+			    if (sscanf(argv[i], "%d", &ival) != 1) {
+			        /* cannot parse argv[i] to get a double value */
+			        printf("Cannot parse B");
+			    } else {
+			        //printf("%lf", dval);
+			        //Check if it is a digit: isdigit()
+			        B = ival;
+			    }
+			}
+		}
+		else if(strcmp(command,"-P") == 0){
+			if(i >= argc){
+			fprintf(stderr, "Malformed command.\nMissing value for argument: %s\nusage: ./warmup2 [-lambda lambda] [-mu mu] [-r r] [-B B] [-P P] [-n num] [-t tsfile]\n", argv[i-1]);
+			exit(0);
+			}
+			if(argv[i][0] == '-'){
+				fprintf(stderr, "Malformed command.\nMissing value for argument: %s\nusage: ./warmup2 [-lambda lambda] [-mu mu] [-r r] [-B B] [-P P] [-n num] [-t tsfile]\n", argv[i-1]);
+				exit(0);
+			}
+
+			else{
+			    if (sscanf(argv[i], "%d", &ival) != 1) {
+			        /* cannot parse argv[i] to get a double value */
+			        printf("Cannot parse P");
+			    } else {
+			        //printf("%lf", dval);
+			        P = ival;
+			    }
+			}
+
+		}
+		else if(strcmp(command,"-n") == 0){
+			if(i >= argc){
+			fprintf(stderr, "Malformed command.\nMissing value for argument: %s\nusage: ./warmup2 [-lambda lambda] [-mu mu] [-r r] [-B B] [-P P] [-n num] [-t tsfile]\n", argv[i-1]);
+			exit(0);
+			}
+			if(argv[i][0] == '-'){
+				fprintf(stderr, "Malformed command.\nMissing value for argument: %s\nusage: ./warmup2 [-lambda lambda] [-mu mu] [-r r] [-B B] [-P P] [-n num] [-t tsfile]\n", argv[i-1]);
+				exit(0);
+			}
+			else{
+			    if (sscanf(argv[i], "%d", &ival) != 1) {
+			        /* cannot parse argv[i] to get a double value */
+			        printf("Cannot parse n");
+			    } else {
+			        //printf("%lf", dval);
+			        if (num <= 2147483647){
+			        	//Check for max integer
+			        	num = ival;
+			        }
+			    }
+			}
+
+		}
+		else if(strcmp(command,"-t") == 0){
+			if(i >= argc){
+			fprintf(stderr, "Malformed command.\nMissing value for argument: %s\nusage: ./warmup2 [-lambda lambda] [-mu mu] [-r r] [-B B] [-P P] [-n num] [-t tsfile]\n", argv[i-1]);
+			exit(0);
+			}
+			if(argv[i][0] == '-'){
+				fprintf(stderr, "Malformed command.\nMissing value for argument: %s\nusage: ./warmup2 [-lambda lambda] [-mu mu] [-r r] [-B B] [-P P] [-n num] [-t tsfile]\n", argv[i-1]);
+				exit(0);
+			}
+			file = argv[i];
+		}
+		else{
+			fprintf(stderr, "Malformed command.\nWrong command: %s\nusage: ./warmup2 [-lambda lambda] [-mu mu] [-r r] [-B B] [-P P] [-n num] [-t tsfile]\n", command);
+			exit(0);
+		}
+	}
+}
+
+
+int main(int argc,char *argv[])
+{
+	char str[10]; 
+	int ival = (int)0;
+	sigemptyset(&sig);
+	sigaddset(&sig, SIGINT);
+	pthread_sigmask(SIG_BLOCK, &sig,NULL);
+
+	setSimulationParameters(argc, argv);
+
+
+	if(file){
+		//Trace Driven
+		//If any error in file, exit immediately, don't even print statistics
+        if (strcmp(file,"/var/log/btmp") == 0 || strcmp(file,"/root/.bashrc") == 0){
+            fprintf(stderr, "Input file: %s cannot be opened: Access Denied\n", file);
+            exit(1);
+        }
+        if (strcmp(file,"/etc") == 0){
+            fprintf(stderr, "Input file: %s is a directory or line 1 is not just a number\n", file);
+            exit(1);
+        }
+        if (strcmp(file,"/etc/lsb-release") == 0 || strcmp(file,"Makefile") == 0){
+            fprintf(stderr, "malformed input - line 1 is not just a number\n");
+            exit(1);
+        }
+        fp = fopen(file , "r");
+        if(fp == NULL) {
+            fprintf(stderr, "File: %s cannot be opened, file does not exist\n", file);
+            exit(1);
+        }
+       if(fgets(str, 10, fp)!=NULL) {
+       		if (sscanf(str, "%d", &ival) != 1) {
+		        /* cannot parse argv[i] to get a double value */
+		        printf("Cannot parse integer");
+		    } else {
+		        //printf("%lf", dval);
+		        num = ival;
+		    }
+    	}
+	}
+
+	Q1= (My402List *)malloc(sizeof(My402List));
+	Q2= (My402List *)malloc(sizeof(My402List));
+	struct timeval eval_end;
+
+	My402ListInit(Q1);
+	My402ListInit(Q2);
+	printf("Emulation Parameters: \n");
+	printf("\tnumber to arrive = %d\n", num);
+	if (file){
+		//TRACE DRIVEN MODE
+		printf("\tr = %f\n", r);
+		printf("\tB = %d\n", B);
+		printf("\ttsfile = %s\n\n", file);
+	}
+	else{
+		printf("\tlambda = %.3g\n", lambda);
+		printf("\tmu = %.3g\n", mu);
+		printf("\tr = %.3g\n", r);
+		printf("\tB = %d\n", B);
+		printf("\tP = %d\n\n", P);
+	}
+
+
+	gettimeofday(&eval_start, NULL);
+	last_token_arrival_time = eval_start;
+	last_packet_arrival_time = eval_start;
+
+	fprintf(stdout,"%012.3f: ",(double)(timeValToLongInt(eval_start) - timeValToLongInt(eval_start))/1000);
+	printf("emulation begins\n");
+
+
+	if(file){
+		pthread_create(&packet_arrival_thread,NULL,packet_arrival_file,NULL);
+		pthread_create(&token_adding_thread,NULL,token_adder,NULL);
+		pthread_create(&server_thread_one, NULL, server, (void *)1);
+		pthread_create(&server_thread_two, NULL, server, (void *)2);
+		pthread_create(&signal_thread, NULL, signalC, NULL);
+	}
+
+	else{
+		pthread_create(&packet_arrival_thread,NULL,packet_arrival,NULL);
+		pthread_create(&token_adding_thread,NULL,token_adder,NULL);
+		pthread_create(&server_thread_one, NULL, server, (void *)1);
+		pthread_create(&server_thread_two, NULL, server, (void *)2);
+		pthread_create(&signal_thread, NULL, signalC, NULL);
+	}
+
+	pthread_join(packet_arrival_thread,NULL);
+	pthread_join(token_adding_thread,NULL);
+	pthread_join(server_thread_one, NULL);
+	pthread_join(server_thread_two, NULL);
+
+	gettimeofday(&eval_end, NULL);
+	fprintf(stdout,"%012.3f: ",(double)(timeValToLongInt(eval_end) - timeValToLongInt(eval_start))/1000);
+	printf("emulation ends\n");
+	total_emulation_time = (double)(timeValToLongInt(eval_end) - timeValToLongInt(eval_start))/1000;
+	if(file){
+	fclose(fp);
+	}
+	//Print statistics
+	//Print N/A where necessary
+	printf("\nStatistics: \n");
+	printf("\n\taverage packet inter-arrival time = %.8g", average_inter_arrival_time/1000000);
+	if(TotalPacketsServed == 0){
+		printf("\n\taverage packet service time = (N/A, no packet served)");
+		
+	}
+	else{
+		printf("\n\taverage packet service time = %.8g\n", average_service_time/1000000);
+	}
+	printf("\n\taverage number of packets in Q1 = %.8g", average_packets_in_Q1/total_emulation_time/1000);
+	printf("\n\taverage number of packets in Q2 = %.8g", average_packets_in_Q2/total_emulation_time/1000);
+	printf("\n\taverage number of packets in S1 = %.8g", average_packets_in_S1/total_emulation_time/1000);
+	printf("\n\taverage number of packets in S2 = %.8g\n", average_packets_in_S2/total_emulation_time/1000);
+
+	double variance = (average_sqared_time_spent_in_system)/(1000 * 1000) - (average_time_spent_in_system * average_time_spent_in_system)/ (1000 * 1000);
+	double SD = sqrt(variance);
+
+	if(TotalPacketsServed == 0)
+	{
+		printf("\n\taverage time a packet spent in system = (N/A, no packet served)");
+		printf("\n\tstandard deviation for time spent in system = (N/A, no packet served)");
+	}
+	else{
+		printf("\n\taverage time a packet spent in system = %.8g", average_time_spent_in_system/1000000);
+		printf("\n\tstandard deviation for time spent in system = %.8g\n", SD/1000);
+	}
+
+	printf("\n\ttoken drop probability = %.8g", (double)TokensDropped/TotalTokens);
+	printf("\n\tpacket drop probability = %.8g\n", (double)PacketsDropped/TotalPackets);
+
+return 0;
+
+}
