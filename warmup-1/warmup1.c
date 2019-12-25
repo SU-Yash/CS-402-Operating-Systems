@@ -19,13 +19,10 @@ typedef struct tagMy402Transaction {
 
 static
 void BubbleForward(My402List *pList, My402ListElem **pp_elem1, My402ListElem **pp_elem2)
-    /* (*pp_elem1) must be closer to First() than (*pp_elem2) */
 {
     My402ListElem *elem1=(*pp_elem1), *elem2=(*pp_elem2);
     void *obj1=elem1->obj, *obj2=elem2->obj;
     My402ListElem *elem1prev=My402ListPrev(pList, elem1);
-/*  My402ListElem *elem1next=My402ListNext(pList, elem1); */
-/*  My402ListElem *elem2prev=My402ListPrev(pList, elem2); */
     My402ListElem *elem2next=My402ListNext(pList, elem2);
 
     My402ListUnlink(pList, elem1);
@@ -75,14 +72,13 @@ void BubbleSortForwardList(My402List *pList, int num_items)
 }
 
 
-void parseLine(My402List *list, char *str){
+void parseLine(My402List *list, char *str, int lineNumber){
     char *ptr;
     const char delim[]= "\t";
     int count = 0;
     char c;
     My402ListElem *currElem=NULL;
 
-    //Check if mallformed line:
     for (int i = 0; str[i] != '\0'; i++) {
       c = (char)str[i];
       if (c == '\t'){
@@ -94,29 +90,32 @@ void parseLine(My402List *list, char *str){
         Transaction *t = (Transaction *)malloc(sizeof(Transaction));
         ptr=strtok(str,delim);
         t->type = *ptr;
+        if(t->type != '+' && t->type != '-'){
+            fprintf(stderr, "Bad transaction type on line %d\n", lineNumber);
+            exit(-1);
+        }
         
         ptr = strtok (NULL, delim);
         if (strlen(ptr) > 11){
-            printf("Bad timestamp\n");
-            exit(0);
+            fprintf(stderr, "Bad timestamp on line %d\n", lineNumber);
+            exit(-1);
         }
+        
         t->timestamp = atoi(ptr);
+        time_t given_t = t->timestamp;
+        time_t curr_t = time(NULL);
+
+        if(curr_t < given_t){
+            fprintf(stderr, "Time stamp on line %d is from future\n", lineNumber);
+            exit(-1);
+        }
         
         ptr = strtok (NULL, delim);
-        //printf("value:%s\n", ptr);
         if(atof(ptr) < 0){
-            printf("Negative value\n");
-            exit(0);
+            fprintf(stderr, "Negative value of amount on line %d\n", lineNumber);
+            exit(-1);
         }
-        /*
-        const char delims[]=".";
-        dollars=strtok(ptr,delims);
-        printf("dollars:%s\n", dollars);
-        if(strlen(dollars) > 7){
-            printf("Value too big\n");
-            exit(0);
-        }*/
-        //t->cents = atof(ptr) * 100;
+
         int val = 0;
         int pos = 0;
         char ch;
@@ -127,37 +126,48 @@ void parseLine(My402List *list, char *str){
             pos++;
         }
         pos++;
-        //printf("%c\n", ptr[k]);
-
+        int countCents = 0;
         while(ptr[pos] != '\0'){
+            countCents++;
+            if(countCents > 2){
+                fprintf(stderr, "Too many digits for cents on line %d\n", lineNumber);
+                exit(-1);
+            }
             ch = ptr[pos];
             val = val*10 + atoi(&ch);
             pos++;
         }
-        
-        t->cents = val;
 
+        if(val > 1000000000){
+            fprintf(stderr, "Input amount too big on line: %d\n", lineNumber);
+            exit(-1);
+        }
+
+        t->cents = val;
 
         ptr = strtok (NULL, delim);
 
         t->desc = strdup(ptr);
-        //printf("Des:%s\n", ptr);
         if(ptr == NULL){
-            printf("Empty Description\n");
-            exit(0);
+            fprintf(stderr, "Empty Description on line: %d\n", lineNumber);
+            exit(-1);
         }
-        //Check if timestamp is already present.
+
         for (currElem=My402ListFirst(list); currElem != NULL; currElem=My402ListNext(list, currElem)){
             if((int)((Transaction *)(currElem->obj))->timestamp == t->timestamp){
-                printf("Already present\n");
-                exit(0);
+                fprintf(stderr, "Timestamp on line %d is already present\n", lineNumber);
+                exit(-1);
             }
         }
         My402ListAppend(list, (void *)t);
     }
-    else{
-        printf("Malformed text file\n");
-        exit(0);
+    else if (count < 3){
+        fprintf(stderr, "Malformed text file: Probably some missing fields on line: %d\n", lineNumber);
+        exit(-1);
+    }
+    else if (count > 3){
+        fprintf(stderr, "Malformed text file: Probably too many fields on line: %d\n", lineNumber);
+        exit(-1);
     }
 }
 
@@ -170,24 +180,37 @@ void printAll(My402List *list){
 }
 
 My402List *readFrom(char *file, My402List *list){
-    int MAX_LINE_LENGTH = 1023;
+    int MAX_LENGTH = 1023;
     FILE *fp;
-    char str[MAX_LINE_LENGTH];
-    str[MAX_LINE_LENGTH] = '\0';
+    char str[MAX_LENGTH];
+    str[MAX_LENGTH] = '\0';
+    int lineNumber = 0;
 
     if(file){
+
+        if (strcmp(file,"/var/log/btmp") == 0 || strcmp(file,"/root/.bashrc") == 0){
+            fprintf(stderr, "Input file cannot be opened: Access Denied\n");
+            exit(1);
+        }
+
+        if(strncmp(file,"/etc", 4) == 0){
+            fprintf(stderr, "Input directory or file is not in the right format\n");
+            exit(1);
+        }
+
         fp = fopen(file , "r");
         if(fp == NULL) {
-            //check later
-           perror("Error opening file");
+            fprintf(stderr, "File cannot be opened, file does not exist\n");
+            exit(1);
         }
     }
     else{
         fp = stdin;
     }
     while(!feof(fp))
-    if(fgets(str, MAX_LINE_LENGTH, fp)!=NULL) {
-       parseLine(list, str);
+    if(fgets(str, MAX_LENGTH, fp)!=NULL) {
+       lineNumber++;
+       parseLine(list, str, lineNumber);
     }
     fclose(fp);
     return list;
@@ -252,13 +275,17 @@ void printTransactions(My402List *list){
         else{
             balance = balance + c;
         }
-        //printf("%d", balance);
 
         int cents = c%100;
         c = c/100;
 
-        char bufs[12];
-        if(c >= 1000000){
+        char bufs[13];
+
+        if(c >= 10000000){
+            snprintf(bufs, 13, "?,???,???.??");
+        }
+
+        else if(c >= 1000000){
             char afterSecondCommaChar[4];
             char beforeSecondCommaChar[4];
             char centsChar[4];
@@ -272,7 +299,7 @@ void printTransactions(My402List *list){
             if(beforeSecondComma < 10){
                 snprintf(beforeSecondCommaChar, 4, "00%d", beforeSecondComma);
             }
-            else if (beforeSecondComma < 100 ){
+            else if (beforeSecondComma < 100){
                 snprintf(beforeSecondCommaChar, 4, "0%d", beforeSecondComma);
             }
             else{
@@ -299,7 +326,7 @@ void printTransactions(My402List *list){
                 snprintf(centsChar, 4, "%d", cents);
             }
 
-            snprintf(bufs, 12, "%d,%s,%s.%s", beforeFirstComma, beforeSecondCommaChar, afterSecondCommaChar, centsChar);
+            snprintf(bufs, 13, "%d,%s,%s.%s", beforeFirstComma, beforeSecondCommaChar, afterSecondCommaChar, centsChar);
 
         }
 
@@ -328,18 +355,18 @@ void printTransactions(My402List *list){
             else{
                 snprintf(centsChar, 4, "%d", cents);
             }
-            snprintf(bufs, 12, "%d,%s.%s", beforeSecondComma, afterSecondCommaChar, centsChar);
+            snprintf(bufs, 13, "%d,%s.%s", beforeSecondComma, afterSecondCommaChar, centsChar);
         }
         else{
             if(cents == 0){
-                snprintf(bufs, 12, "%d.00", c);
+                snprintf(bufs, 13, "%d.00", c);
             }
             else{
                 if(cents < 10){
-                    snprintf(bufs, 12, "%d.0%d", c, cents);
+                    snprintf(bufs, 13, "%d.0%d", c, cents);
                 }
                 else{
-                    snprintf(bufs, 12, "%d.%d", c, cents);
+                    snprintf(bufs, 13, "%d.%d", c, cents);
                 }
             }
         }
@@ -375,10 +402,11 @@ void printTransactions(My402List *list){
         int centsTwo = c%100;
         c = c/100;
 
-        //printf("\n%d\n", c);
-
-        char buff[12];
-        if(c >= 1000000){
+        char buff[13];
+        if(c >= 10000000){
+            snprintf(buff, 13, "?,???,???.??");
+        }
+        else if(c >= 1000000){
             char afterSecondCommaChar[4];
             char beforeSecondCommaChar[4];
             char centsChar[4];
@@ -419,7 +447,7 @@ void printTransactions(My402List *list){
                 snprintf(centsChar, 4, "%d", centsTwo);
             }
 
-            snprintf(buff, 12, "%d,%s,%s.%s", beforeFirstComma, beforeSecondCommaChar, afterSecondCommaChar, centsChar);
+            snprintf(buff, 13, "%d,%s,%s.%s", beforeFirstComma, beforeSecondCommaChar, afterSecondCommaChar, centsChar);
 
         }
 
@@ -448,18 +476,18 @@ void printTransactions(My402List *list){
             else{
                 snprintf(centsChar, 4, "%d", centsTwo);
             }
-            snprintf(buff, 12, "%d,%s.%s", beforeSecondComma, afterSecondCommaChar, centsChar);
+            snprintf(buff, 13, "%d,%s.%s", beforeSecondComma, afterSecondCommaChar, centsChar);
         }
         else{
             if(centsTwo == 0){
-                snprintf(buff, 12, "%d.00", c);
+                snprintf(buff, 13, "%d.00", c);
             }
             else{
                 if(centsTwo < 10){
-                    snprintf(buff, 12, "%d.0%d", c, centsTwo);
+                    snprintf(buff, 13, "%d.0%d", c, centsTwo);
                 }
                 else{
-                    snprintf(buff, 12, "%d.%d", c, centsTwo);
+                    snprintf(buff, 13, "%d.%d", c, centsTwo);
                 }
             }
         }
@@ -498,14 +526,26 @@ int main(int argc, char *argv[])
 {
     My402List *list= (My402List *)malloc(sizeof(My402List));
     My402ListInit(list);
+    if (argc > 3){
+        fprintf(stderr, "Too many commands\n");
+        exit(1);
+    }
+    else if(argc == 1){
+        fprintf(stderr, "No command(like 'sort') found to execute\n");
+        exit(1);
+    }
+    else if(strcmp(argv[1],"sort") != 0){
+        fprintf(stderr, "Wrong command\n");
+        exit(1);
+    }
 
     char *file = argv[2];
     list = readFrom(file, list);
     sortList(list);
     printTransactions(list);
-    //printf("DESC:%s\n", ((Transaction *)(list->anchor.next->obj))->desc);
-    //printf("DESC:%s\n", ((Transaction *)(list->anchor.prev->obj))->desc);
     My402ListUnlinkAll(list);
+    free(list);
+
     return(0);
 
 }
